@@ -5,5 +5,9 @@ data/profiles.json
 data/profiles.tmp
 data/library.json
 data/library.tmp
+data/server.pid
+data/server.log
+data/server-error.log
 data/images/*
 !data/images/.gitkeep
+
