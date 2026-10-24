@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 IMAGE_DIR = DATA_DIR / "images"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+PROFILE_FILE = DATA_DIR / "profiles.json"
 LIBRARY_FILE = DATA_DIR / "library.json"
 EXPIRY_SECONDS = 72 * 60 * 60
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
@@ -48,8 +49,51 @@ def read_json(path: Path, default):
         return default
 
 
+def write_profiles(store: dict) -> None:
+    with state_lock:
+        temporary = PROFILE_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(PROFILE_FILE)
+        try:
+            PROFILE_FILE.chmod(0o600)
+        except OSError:
+            pass
+
+
+def profiles_store() -> dict:
+    store = read_json(PROFILE_FILE, None)
+    if isinstance(store, dict) and isinstance(store.get("profiles"), list) and store["profiles"]:
+        ids = {profile.get("id") for profile in store["profiles"] if isinstance(profile, dict)}
+        if store.get("active_profile_id") in ids:
+            return store
+        store["active_profile_id"] = next(iter(ids), None)
+        write_profiles(store)
+        return store
+
+    # One-time migration: preserve the existing connection and secret as the first scheme.
+    legacy = DEFAULT_SETTINGS | read_json(SETTINGS_FILE, {})
+    profile = {"id": uuid.uuid4().hex, "name": "默认方案", "settings": legacy}
+    store = {"active_profile_id": profile["id"], "profiles": [profile]}
+    write_profiles(store)
+    return store
+
+
+def active_profile(store: dict | None = None) -> dict:
+    store = store or profiles_store()
+    return next((profile for profile in store["profiles"] if profile.get("id") == store.get("active_profile_id")), store["profiles"][0])
+
+
+def public_profiles(store: dict | None = None) -> dict:
+    store = store or profiles_store()
+    return {
+        "active_profile_id": store.get("active_profile_id"),
+        "profiles": [{"id": profile["id"], "name": profile["name"]} for profile in store["profiles"]],
+    }
+
+
 def settings():
-    values = DEFAULT_SETTINGS | read_json(SETTINGS_FILE, {})
+    profile = active_profile()
+    values = DEFAULT_SETTINGS | profile.get("settings", {})
     if values.get("api_mode") not in ("images", "chat"):
         values["api_mode"] = "images"
     return values
@@ -57,7 +101,12 @@ def settings():
 
 def save_settings(values: dict) -> None:
     with state_lock:
-        SETTINGS_FILE.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding="utf-8")
+        store = profiles_store()
+        profile = active_profile(store)
+        profile["settings"] = DEFAULT_SETTINGS | values
+        write_profiles(store)
+        # Keep the legacy local file in sync for recovery by older builds; it is git-ignored.
+        SETTINGS_FILE.write_text(json.dumps(profile["settings"], ensure_ascii=False, indent=2), encoding="utf-8")
         try:
             SETTINGS_FILE.chmod(0o600)
         except OSError:
@@ -71,7 +120,9 @@ def library() -> list[dict]:
 
 def save_library(records: list[dict]) -> None:
     with state_lock:
-        LIBRARY_FILE.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = LIBRARY_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(LIBRARY_FILE)
 
 
 def cleanup_expired() -> int:
@@ -128,7 +179,10 @@ def persist_image(data: bytes, mime: str, prompt: str, model: str) -> dict:
         raise ValueError("响应内容不是可识别的图片。")
     image_id = uuid.uuid4().hex
     filename = image_id + extension
-    (IMAGE_DIR / filename).write_bytes(data)
+    final_path = IMAGE_DIR / filename
+    temporary_path = final_path.with_suffix(final_path.suffix + ".tmp")
+    temporary_path.write_bytes(data)
+    temporary_path.replace(final_path)
     item = {
         "id": image_id,
         "file": filename,
@@ -299,17 +353,83 @@ def call_provider(cfg: dict, prompt: str, reference_file):
     return found, raw_text
 
 
+@app.after_request
+def disable_api_cache(response):
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.get("/")
 def home():
     cleanup_expired()
     return render_template("index.html")
 
 
+@app.get("/api/profiles")
+def get_profiles():
+    return jsonify(public_profiles())
+
+
+@app.post("/api/profiles")
+def create_profile():
+    incoming = request.get_json(silent=True) or {}
+    name = str(incoming.get("name", "")).strip()[:60]
+    if not name:
+        return jsonify(error="请给方案起个名字。"), 400
+    store = profiles_store()
+    if any(profile.get("name", "").casefold() == name.casefold() for profile in store["profiles"]):
+        return jsonify(error="已经有同名方案，请换一个名字。"), 409
+    current = DEFAULT_SETTINGS | active_profile(store).get("settings", {})
+    supplied = incoming.get("settings") if isinstance(incoming.get("settings"), dict) else {}
+    for key in ("base_url", "model", "api_mode", "endpoint_path", "size", "convert_embedded"):
+        if key in supplied:
+            current[key] = supplied[key]
+    if supplied.get("api_key"):
+        current["api_key"] = str(supplied["api_key"])
+    profile = {"id": uuid.uuid4().hex, "name": name, "settings": current}
+    store["profiles"].append(profile)
+    store["active_profile_id"] = profile["id"]
+    write_profiles(store)
+    return jsonify(public_profiles(store)), 201
+
+
+@app.post("/api/profiles/select")
+def select_profile():
+    incoming = request.get_json(silent=True) or {}
+    profile_id = incoming.get("profile_id")
+    store = profiles_store()
+    if not any(profile.get("id") == profile_id for profile in store["profiles"]):
+        return jsonify(error="找不到这个方案。"), 404
+    store["active_profile_id"] = profile_id
+    write_profiles(store)
+    return jsonify(public_profiles(store))
+
+
+@app.delete("/api/profiles/<profile_id>")
+def delete_profile(profile_id):
+    store = profiles_store()
+    if len(store["profiles"]) <= 1:
+        return jsonify(error="至少保留一套连接方案。"), 400
+    removed = next((profile for profile in store["profiles"] if profile.get("id") == profile_id), None)
+    if removed is None:
+        return jsonify(error="找不到这个方案。"), 404
+    store["profiles"] = [profile for profile in store["profiles"] if profile.get("id") != profile_id]
+    if store.get("active_profile_id") == profile_id:
+        store["active_profile_id"] = store["profiles"][0]["id"]
+    write_profiles(store)
+    return jsonify(public_profiles(store))
+
+
 @app.get("/api/settings")
 def get_settings():
     cfg = settings()
     cfg.pop("api_key", None)
+    active = active_profile()
     cfg["api_key_set"] = bool(settings().get("api_key"))
+    cfg["profile_id"] = active["id"]
+    cfg["profile_name"] = active["name"]
     return jsonify(cfg)
 
 
@@ -331,7 +451,10 @@ def update_settings():
     save_settings(cfg)
     safe = cfg.copy()
     safe.pop("api_key", None)
+    active = active_profile()
     safe["api_key_set"] = bool(cfg.get("api_key"))
+    safe["profile_id"] = active["id"]
+    safe["profile_name"] = active["name"]
     return jsonify(safe)
 
 
