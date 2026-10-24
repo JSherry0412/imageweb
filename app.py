@@ -5,6 +5,7 @@ import binascii
 import json
 import mimetypes
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -13,16 +14,19 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
+from io import BytesIO
 from flask import Flask, jsonify, render_template, request, send_file
+from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 IMAGE_DIR = DATA_DIR / "images"
+REFERENCE_DIR = DATA_DIR / "reference_sets"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 PROFILE_FILE = DATA_DIR / "profiles.json"
 LIBRARY_FILE = DATA_DIR / "library.json"
-EXPIRY_SECONDS = 72 * 60 * 60
+EXPIRY_SECONDS = 7 * 24 * 60 * 60
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
 MAX_REFERENCE_COUNT = 16
 
@@ -30,6 +34,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_REFERENCE_BYTES * MAX_REFERENCE_COUNT + 2 * 1024 * 1024
 DATA_DIR.mkdir(exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
 state_lock = threading.RLock()
 
 DEFAULT_SETTINGS = {
@@ -126,6 +131,72 @@ def save_library(records: list[dict]) -> None:
         temporary.replace(LIBRARY_FILE)
 
 
+def save_reference_set(reference_set_id: str, reference_files) -> None:
+    if not reference_files:
+        return
+    folder = REFERENCE_DIR / reference_set_id
+    folder.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    for index, reference in enumerate(reference_files, start=1):
+        reference.stream.seek(0)
+        content = reference.read()
+        reference.stream.seek(0)
+        safe_name = secure_filename(reference.filename or "reference.png") or "reference.png"
+        extension = Path(safe_name).suffix or ".png"
+        filename = f"{index:02d}{extension.lower()}"
+        (folder / filename).write_bytes(content)
+        manifest.append({"file": filename, "name": safe_name, "mime": reference.mimetype or "image/png"})
+    (folder / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_reference_set(reference_set_id: str | None):
+    if not reference_set_id:
+        return []
+    folder = REFERENCE_DIR / reference_set_id
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("原参考图文件不存在，无法按原条件重生成。")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("原参考图信息无法读取，无法按原条件重生成。") from exc
+    references = []
+    for item in manifest:
+        file_path = folder / item["file"]
+        if not file_path.is_file():
+            raise ValueError("原参考图文件不完整，无法按原条件重生成。")
+        references.append(FileStorage(stream=BytesIO(file_path.read_bytes()), filename=item["name"], content_type=item["mime"]))
+    return references
+
+
+def cleanup_reference_sets(records: list[dict]) -> None:
+    used = {item.get("reference_set_id") for item in records if item.get("reference_set_id")}
+    for folder in REFERENCE_DIR.iterdir():
+        if folder.is_dir() and folder.name not in used:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def provider_path(cfg: dict, has_references: bool) -> str:
+    path = cfg.get("endpoint_path", "/images/generations").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    if has_references and cfg.get("api_mode", "images") == "images" and path.endswith("/generations"):
+        path = path[:-len("generations")] + "edits"
+    return path
+
+
+def generation_settings_snapshot(cfg: dict, profile_id: str, has_references: bool) -> dict:
+    return {
+        "profile_id": profile_id,
+        "base_url": cfg.get("base_url", "").strip().rstrip("/"),
+        "model": cfg.get("model", ""),
+        "api_mode": cfg.get("api_mode", "images"),
+        "endpoint_path": provider_path(cfg, has_references),
+        "size": cfg.get("size", "1024x1024"),
+        "convert_embedded": bool(cfg.get("convert_embedded", True)),
+    }
+
+
 def cleanup_expired() -> int:
     now = time.time()
     with state_lock:
@@ -147,6 +218,7 @@ def cleanup_expired() -> int:
                 removed += 1
         if len(kept) != len(records):
             save_library(kept)
+        cleanup_reference_sets(kept)
         return removed
 
 
@@ -174,7 +246,7 @@ def guess_extension(mime: str, data: bytes) -> str:
     return extension, mime or "application/octet-stream"
 
 
-def persist_image(data: bytes, mime: str, prompt: str, model: str) -> dict:
+def persist_image(data: bytes, mime: str, prompt: str, model: str, generation_settings: dict | None = None, reference_set_id: str | None = None) -> dict:
     extension, mime = guess_extension(mime, data)
     if not mime.startswith("image/"):
         raise ValueError("响应内容不是可识别的图片。")
@@ -192,6 +264,8 @@ def persist_image(data: bytes, mime: str, prompt: str, model: str) -> dict:
         "model": model,
         "created_at": time.time(),
         "downloaded": False,
+        "generation_settings": generation_settings,
+        "reference_set_id": reference_set_id,
     }
     with state_lock:
         records = library()
@@ -208,7 +282,8 @@ def public_item(item: dict) -> dict:
         "model": item.get("model", ""),
         "created_at": item.get("created_at", 0),
         "downloaded": bool(item.get("downloaded")),
-        "url": f"/api/images/{item['id']}/file",
+        "has_saved_route": bool(item.get("generation_settings")),
+        "url": f"/api/images/{item['id']}/file?v={int(float(item.get('updated_at', item.get('created_at', 0))) * 1000)}",
         "download_url": f"/api/images/{item['id']}/download",
     }
 
@@ -274,11 +349,7 @@ def call_provider(cfg: dict, prompt: str, reference_files, quantity: int = 1):
     if not cfg.get("model", "").strip():
         raise ValueError("请先填写模型名称。")
     mode = cfg.get("api_mode", "images")
-    path = cfg.get("endpoint_path", "/images/generations").strip()
-    if not path.startswith("/"):
-        path = "/" + path
-    if reference_files and mode == "images" and path.endswith("/generations"):
-        path = path[:-len("generations")] + "edits"
+    path = provider_path(cfg, bool(reference_files))
     url = base + path
     headers = {"Authorization": "Bearer " + cfg["api_key"], "Accept": "application/json, image/*, text/plain"}
     timeout = 300
@@ -501,13 +572,81 @@ def generate():
     cfg = settings()
     if "convert_embedded" in request.form:
         cfg["convert_embedded"] = request.form.get("convert_embedded") == "true"
+    profile_id = active_profile().get("id", "")
+    saved_route = generation_settings_snapshot(cfg, profile_id, bool(references))
+    reference_set_id = uuid.uuid4().hex if references else None
     try:
         images, text = call_provider(cfg, prompt, references, quantity)
         if images:
-            results = [persist_image(data, mime, prompt, cfg["model"]) for mime, data in images]
+            if reference_set_id:
+                save_reference_set(reference_set_id, references)
+            results = [persist_image(data, mime, prompt, cfg["model"], saved_route, reference_set_id) for mime, data in images]
             return jsonify(images=results, response_text=text)
         return jsonify(images=[], response_text=text, error="接口没有返回可识别的图片。请检查接口模式，或开启 Markdown/Base64 转图。"), 422
     except (ValueError, RuntimeError, requests.RequestException) as exc:
+        return jsonify(error=str(exc)), 502
+
+
+@app.post("/api/images/<image_id>/regenerate")
+def regenerate_image(image_id):
+    with state_lock:
+        item = next((record.copy() for record in library() if record.get("id") == image_id), None)
+    if not item:
+        return jsonify(error="图片不存在或已清理。"), 404
+    prompt = item.get("prompt", "").strip()
+    if not prompt:
+        return jsonify(error="这张图片没有可用的历史提示词。"), 400
+
+    snapshot = item.get("generation_settings")
+    if snapshot:
+        store = profiles_store()
+        profile = next((entry for entry in store["profiles"] if entry.get("id") == snapshot.get("profile_id")), None)
+        if not profile:
+            return jsonify(error="原连接方案已删除，无法使用原方案重生成。"), 409
+        cfg = DEFAULT_SETTINGS | profile.get("settings", {})
+        for key in ("base_url", "model", "api_mode", "endpoint_path", "size", "convert_embedded"):
+            if key in snapshot:
+                cfg[key] = snapshot[key]
+    else:
+        # Legacy records predate route snapshots; the UI explicitly confirms this fallback.
+        profile_id = active_profile().get("id", "")
+        cfg = settings()
+
+    try:
+        references = load_reference_set(item.get("reference_set_id"))
+        if not snapshot:
+            snapshot = generation_settings_snapshot(cfg, profile_id, bool(references))
+        images, text = call_provider(cfg, prompt, references, 1)
+        if not images:
+            return jsonify(error="接口没有返回可识别的图片。", response_text=text), 422
+        mime, data = images[0]
+        extension, mime = guess_extension(mime, data)
+        if not mime.startswith("image/"):
+            raise ValueError("响应内容不是可识别的图片。")
+        new_filename = image_id + extension
+        new_path = IMAGE_DIR / new_filename
+        temporary_path = new_path.with_suffix(new_path.suffix + ".tmp")
+        temporary_path.write_bytes(data)
+        temporary_path.replace(new_path)
+        with state_lock:
+            records = library()
+            current = next((record for record in records if record.get("id") == image_id), None)
+            if current is None:
+                new_path.unlink(missing_ok=True)
+                return jsonify(error="图片已被删除，无法覆盖。"), 404
+            old_path = IMAGE_DIR / current.get("file", "")
+            current["file"] = new_filename
+            current["mime"] = mime
+            current["model"] = cfg["model"]
+            current["created_at"] = time.time()
+            current["updated_at"] = current["created_at"]
+            current["downloaded"] = False
+            current["generation_settings"] = snapshot or None
+            save_library(records)
+            if old_path != new_path:
+                old_path.unlink(missing_ok=True)
+            return jsonify(public_item(current))
+    except (ValueError, RuntimeError, requests.RequestException, OSError) as exc:
         return jsonify(error=str(exc)), 502
 
 
@@ -542,7 +681,9 @@ def delete_image(image_id):
         if not item:
             return jsonify(error="图片不存在。"), 404
         (IMAGE_DIR / item["file"]).unlink(missing_ok=True)
-        save_library([record for record in records if record.get("id") != image_id])
+        remaining = [record for record in records if record.get("id") != image_id]
+        save_library(remaining)
+        cleanup_reference_sets(remaining)
     return jsonify(ok=True)
 
 
