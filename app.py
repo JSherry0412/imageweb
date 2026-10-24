@@ -188,7 +188,7 @@ def persist_image(data: bytes, mime: str, prompt: str, model: str) -> dict:
         "id": image_id,
         "file": filename,
         "mime": mime,
-        "prompt": prompt[:1000],
+        "prompt": prompt[:4000],
         "model": model,
         "created_at": time.time(),
         "downloaded": False,
@@ -265,7 +265,7 @@ def response_text(payload) -> str:
     return ""
 
 
-def call_provider(cfg: dict, prompt: str, reference_files):
+def call_provider(cfg: dict, prompt: str, reference_files, quantity: int = 1):
     base = cfg["base_url"].strip().rstrip("/")
     if not base:
         raise ValueError("请先填写 API URL。")
@@ -292,10 +292,10 @@ def call_provider(cfg: dict, prompt: str, reference_files):
                 ref_mime = reference_file.mimetype or "image/png"
                 ref_data = base64.b64encode(ref_bytes).decode("ascii")
                 content.append({"type": "image_url", "image_url": {"url": f"data:{ref_mime};base64,{ref_data}"}})
-            payload = {"model": cfg["model"], "messages": [{"role": "user", "content": content}], "stream": False}
+            payload = {"model": cfg["model"], "messages": [{"role": "user", "content": content}], "stream": False, "n": quantity}
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
         else:
-            payload = {"model": cfg["model"], "prompt": prompt, "size": cfg.get("size", "1024x1024"), "n": 1, "response_format": "b64_json"}
+            payload = {"model": cfg["model"], "prompt": prompt, "size": cfg.get("size", "1024x1024"), "n": quantity, "response_format": "b64_json"}
             if reference_files:
                 files = [("image", (secure_filename(reference_file.filename or "reference.png"), reference_file.stream, reference_file.mimetype or "application/octet-stream")) for reference_file in reference_files]
                 response = requests.post(url, headers=headers, data=payload, files=files, timeout=timeout)
@@ -339,10 +339,21 @@ def call_provider(cfg: dict, prompt: str, reference_files):
                             raw_text = f"图片 URL 下载失败：{exc}"
         choices = body.get("choices")
         if isinstance(choices, list) and choices:
-            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-            raw_text = response_text(message.get("content"))
-            if not raw_text:
-                raw_text = response_text(choices[0].get("text", ""))
+            choice_texts = []
+            for choice in choices[:quantity]:
+                if not isinstance(choice, dict):
+                    continue
+                message = choice.get("message", {})
+                choice_text = response_text(message.get("content")) if isinstance(message, dict) else ""
+                if not choice_text:
+                    choice_text = response_text(choice.get("text", ""))
+                if choice_text:
+                    choice_texts.append(choice_text)
+                    if cfg.get("convert_embedded", True):
+                        extracted = extract_embedded_image(choice_text)
+                        if extracted:
+                            found.append(extracted)
+            raw_text = "\n".join(choice_texts)
         if not found and not raw_text:
             raw_text = json.dumps(body, ensure_ascii=False)
     else:
@@ -472,6 +483,12 @@ def generate():
     prompt = request.form.get("prompt", "").strip()
     if not prompt:
         return jsonify(error="请先写下提示词。"), 400
+    try:
+        quantity = int(request.form.get("quantity", "1"))
+    except (TypeError, ValueError):
+        return jsonify(error="生成数量须为 1 到 5。"), 400
+    if not 1 <= quantity <= 5:
+        return jsonify(error="生成数量须为 1 到 5。"), 400
     references = [item for item in request.files.getlist("reference") if item and item.filename]
     if len(references) > MAX_REFERENCE_COUNT:
         return jsonify(error=f"参考图最多 {MAX_REFERENCE_COUNT} 张。"), 413
@@ -485,7 +502,7 @@ def generate():
     if "convert_embedded" in request.form:
         cfg["convert_embedded"] = request.form.get("convert_embedded") == "true"
     try:
-        images, text = call_provider(cfg, prompt, references)
+        images, text = call_provider(cfg, prompt, references, quantity)
         if images:
             results = [persist_image(data, mime, prompt, cfg["model"]) for mime, data in images]
             return jsonify(images=results, response_text=text)
