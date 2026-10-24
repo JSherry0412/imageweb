@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+data/settings.json
+data/library.json
+data/images/*
+!data/images/.gitkeep
