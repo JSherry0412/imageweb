@@ -24,9 +24,10 @@ PROFILE_FILE = DATA_DIR / "profiles.json"
 LIBRARY_FILE = DATA_DIR / "library.json"
 EXPIRY_SECONDS = 72 * 60 * 60
 MAX_REFERENCE_BYTES = 20 * 1024 * 1024
+MAX_REFERENCE_COUNT = 16
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_REFERENCE_BYTES + 2 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_REFERENCE_BYTES * MAX_REFERENCE_COUNT + 2 * 1024 * 1024
 DATA_DIR.mkdir(exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 state_lock = threading.RLock()
@@ -264,7 +265,7 @@ def response_text(payload) -> str:
     return ""
 
 
-def call_provider(cfg: dict, prompt: str, reference_file):
+def call_provider(cfg: dict, prompt: str, reference_files):
     base = cfg["base_url"].strip().rstrip("/")
     if not base:
         raise ValueError("请先填写 API URL。")
@@ -276,7 +277,7 @@ def call_provider(cfg: dict, prompt: str, reference_file):
     path = cfg.get("endpoint_path", "/images/generations").strip()
     if not path.startswith("/"):
         path = "/" + path
-    if reference_file and mode == "images" and path.endswith("/generations"):
+    if reference_files and mode == "images" and path.endswith("/generations"):
         path = path[:-len("generations")] + "edits"
     url = base + path
     headers = {"Authorization": "Bearer " + cfg["api_key"], "Accept": "application/json, image/*, text/plain"}
@@ -285,7 +286,7 @@ def call_provider(cfg: dict, prompt: str, reference_file):
     try:
         if mode == "chat":
             content = [{"type": "text", "text": prompt}]
-            if reference_file:
+            for reference_file in reference_files:
                 ref_bytes = reference_file.read()
                 reference_file.stream.seek(0)
                 ref_mime = reference_file.mimetype or "image/png"
@@ -295,8 +296,9 @@ def call_provider(cfg: dict, prompt: str, reference_file):
             response = requests.post(url, headers=headers, json=payload, timeout=timeout)
         else:
             payload = {"model": cfg["model"], "prompt": prompt, "size": cfg.get("size", "1024x1024"), "n": 1, "response_format": "b64_json"}
-            if reference_file:
-                response = requests.post(url, headers=headers, data=payload, files={"image": (secure_filename(reference_file.filename or "reference.png"), reference_file.stream, reference_file.mimetype or "application/octet-stream")}, timeout=timeout)
+            if reference_files:
+                files = [("image", (secure_filename(reference_file.filename or "reference.png"), reference_file.stream, reference_file.mimetype or "application/octet-stream")) for reference_file in reference_files]
+                response = requests.post(url, headers=headers, data=payload, files=files, timeout=timeout)
             else:
                 response = requests.post(url, headers=headers, json=payload, timeout=timeout)
     except requests.RequestException as exc:
@@ -470,18 +472,20 @@ def generate():
     prompt = request.form.get("prompt", "").strip()
     if not prompt:
         return jsonify(error="请先写下提示词。"), 400
-    reference = request.files.get("reference")
-    if reference and reference.filename:
+    references = [item for item in request.files.getlist("reference") if item and item.filename]
+    if len(references) > MAX_REFERENCE_COUNT:
+        return jsonify(error=f"参考图最多 {MAX_REFERENCE_COUNT} 张。"), 413
+    for reference in references:
         reference.stream.seek(0, 2)
         size = reference.stream.tell()
         reference.stream.seek(0)
         if size > MAX_REFERENCE_BYTES:
-            return jsonify(error="参考图不能超过 20 MB。"), 413
+            return jsonify(error=f"参考图 {reference.filename} 超过 20 MB。"), 413
     cfg = settings()
     if "convert_embedded" in request.form:
         cfg["convert_embedded"] = request.form.get("convert_embedded") == "true"
     try:
-        images, text = call_provider(cfg, prompt, reference if reference and reference.filename else None)
+        images, text = call_provider(cfg, prompt, references)
         if images:
             results = [persist_image(data, mime, prompt, cfg["model"]) for mime, data in images]
             return jsonify(images=results, response_text=text)
