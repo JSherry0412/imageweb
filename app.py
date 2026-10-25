@@ -658,6 +658,66 @@ def get_image(image_id):
     return send_file(IMAGE_DIR / item["file"], mimetype=item.get("mime", "image/png"), conditional=True)
 
 
+@app.get("/api/images/<image_id>/references")
+def list_image_references(image_id):
+    item = next((record for record in library() if record.get("id") == image_id), None)
+    if not item:
+        return jsonify(error="图片不存在或已清理。"), 404
+    reference_set_id = item.get("reference_set_id")
+    recorded = bool(reference_set_id or item.get("generation_settings"))
+    if not reference_set_id:
+        return jsonify(reference_recorded=recorded, references=[])
+    folder = REFERENCE_DIR / reference_set_id
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        return jsonify(error="参考图记录缺失。"), 404
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return jsonify(error="参考图记录无法读取。"), 500
+    references = []
+    for index, entry in enumerate(manifest):
+        if not isinstance(entry, dict):
+            continue
+        filename = entry.get("file", "")
+        if not filename or Path(filename).name != filename:
+            continue
+        reference_path = folder / filename
+        if not reference_path.is_file():
+            continue
+        references.append({
+            "index": index,
+            "name": entry.get("name") or f"参考图 {index + 1}",
+            "mime": entry.get("mime") or "image/png",
+            "url": f"/api/images/{image_id}/references/{index}",
+        })
+    return jsonify(reference_recorded=True, references=references)
+
+
+@app.get("/api/images/<image_id>/references/<int:index>")
+def get_image_reference(image_id, index):
+    item = next((record for record in library() if record.get("id") == image_id), None)
+    if not item:
+        return jsonify(error="图片不存在或已清理。"), 404
+    reference_set_id = item.get("reference_set_id")
+    if not reference_set_id:
+        return jsonify(error="这张图片没有参考图。"), 404
+    folder = REFERENCE_DIR / reference_set_id
+    try:
+        manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+        entry = manifest[index]
+        filename = entry.get("file", "")
+        if not filename or Path(filename).name != filename:
+            raise ValueError("Invalid reference filename")
+        reference_path = folder / filename
+        mime = entry.get("mime") or "image/png"
+    except (OSError, ValueError, IndexError, TypeError, AttributeError):
+        return jsonify(error="参考图文件不可用。"), 404
+    if not reference_path.is_file():
+        return jsonify(error="参考图文件不存在。"), 404
+    return send_file(reference_path, mimetype=mime, conditional=True)
+
+
 @app.get("/api/images/<image_id>/download")
 def download_image(image_id):
     with state_lock:
