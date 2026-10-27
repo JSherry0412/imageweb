@@ -8,7 +8,7 @@ function Get-ImageAtelierState {
     try {
         $settings = Invoke-RestMethod -Uri "$base/api/settings" -TimeoutSec 2
         $page = (Invoke-WebRequest -Uri $base -TimeoutSec 2).Content
-        return @{ Running = [bool]$settings.profile_id; Current = [bool]$settings.profile_id -and $page.Contains('reference-collapse-1') }
+        return @{ Running = [bool]$settings.profile_id; Current = [bool]$settings.profile_id -and $page.Contains('image-name-1') }
     } catch {
         return @{ Running = $false; Current = $false }
     }

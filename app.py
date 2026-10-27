@@ -246,7 +246,18 @@ def guess_extension(mime: str, data: bytes) -> str:
     return extension, mime or "application/octet-stream"
 
 
-def persist_image(data: bytes, mime: str, prompt: str, model: str, generation_settings: dict | None = None, reference_set_id: str | None = None) -> dict:
+def clean_download_stem(value: str) -> str:
+    """Keep a user supplied download name safe on Windows and browsers."""
+    name = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(". ")
+    if Path(name).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        name = Path(name).stem.strip(". ")
+    if name.upper() in {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}:
+        name = f"_{name}"
+    return name[:100]
+
+
+def persist_image(data: bytes, mime: str, prompt: str, model: str, generation_settings: dict | None = None, reference_set_id: str | None = None, download_stem: str = "") -> dict:
     extension, mime = guess_extension(mime, data)
     if not mime.startswith("image/"):
         raise ValueError("响应内容不是可识别的图片。")
@@ -266,6 +277,7 @@ def persist_image(data: bytes, mime: str, prompt: str, model: str, generation_se
         "downloaded": False,
         "generation_settings": generation_settings,
         "reference_set_id": reference_set_id,
+        "download_stem": clean_download_stem(download_stem),
     }
     with state_lock:
         records = library()
@@ -554,6 +566,7 @@ def generate():
     prompt = request.form.get("prompt", "").strip()
     if not prompt:
         return jsonify(error="请先写下提示词。"), 400
+    download_stem = clean_download_stem(request.form.get("download_name", ""))
     try:
         quantity = int(request.form.get("quantity", "1"))
     except (TypeError, ValueError):
@@ -580,7 +593,18 @@ def generate():
         if images:
             if reference_set_id:
                 save_reference_set(reference_set_id, references)
-            results = [persist_image(data, mime, prompt, cfg["model"], saved_route, reference_set_id) for mime, data in images]
+            results = [
+                persist_image(
+                    data,
+                    mime,
+                    prompt,
+                    cfg["model"],
+                    saved_route,
+                    reference_set_id,
+                    f"{download_stem}-{index}" if download_stem and len(images) > 1 else download_stem,
+                )
+                for index, (mime, data) in enumerate(images, start=1)
+            ]
             return jsonify(images=results, response_text=text)
         return jsonify(images=[], response_text=text, error="接口没有返回可识别的图片。请检查接口模式，或开启 Markdown/Base64 转图。"), 422
     except (ValueError, RuntimeError, requests.RequestException) as exc:
@@ -730,7 +754,8 @@ def download_image(image_id):
             return jsonify(error="图片文件不存在。"), 404
         item["downloaded"] = True
         save_library(records)
-    return send_file(path, as_attachment=True, download_name=f"image-{image_id[:8]}{path.suffix}", mimetype=item.get("mime", "application/octet-stream"))
+    stem = clean_download_stem(item.get("download_stem", "")) or f"image-{image_id[:8]}"
+    return send_file(path, as_attachment=True, download_name=f"{stem}{path.suffix}", mimetype=item.get("mime", "application/octet-stream"))
 
 
 @app.delete("/api/images/<image_id>")
