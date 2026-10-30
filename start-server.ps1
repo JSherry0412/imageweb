@@ -26,7 +26,7 @@ if ($service.Running) {
     try { $recordedId = [int](Get-Content -LiteralPath $pidPath -Raw).Trim() } catch {}
     $process = if ($recordedId) { Get-CimInstance Win32_Process -Filter "ProcessId = $recordedId" -ErrorAction SilentlyContinue } else { $null }
     if (-not $process -or -not $process.CommandLine -or -not $process.CommandLine.Contains((Join-Path $root 'app.py'))) {
-        throw '检测到旧版工作台仍在运行，但无法安全确认其进程。请先使用“停止图片工作台.bat”停止旧服务，再重新启动。'
+        throw 'An older Image Atelier service is running. Stop it using the stop launcher, then start again.'
     }
     Stop-Process -Id $recordedId -Force
     $deadline = (Get-Date).AddSeconds(10)
